@@ -1,0 +1,17 @@
+# data shards (downloaded via data/cached_fineweb10B.py)
+data/fineweb10B/
+*.bin
+
+# experiment outputs (results/ holds the curated, committed ones; everything else is scratch)
+*.db
+inductor_cache/
+__pycache__/
+*.pyc
+
+# scratch experiment JSONs at the repo root (curated results live in results/)
+/bo_*.json
+/grid*.json
+/results_*.json
+
+# internal working doc — kept locally, not part of the public repo
+/SIMPLIFICATION_PLAN.md
