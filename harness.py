@@ -51,55 +51,12 @@ torch.set_float32_matmul_precision("high")
 
 
 # -----------------------------------------------------------------------------
-# Optional FP8 matmuls (Blackwell tensor cores), opt-in via set_fp8(True).
-# Brings the proxy closer to the record (which trains in FP8) AND ~2x faster on the
-# big GEMMs. Default off -> identical bf16 behaviour, so runs stay comparable.
-
-_FP8_ENABLED = False
-
-
-def set_fp8(flag):
-    global _FP8_ENABLED
-    _FP8_ENABLED = bool(flag)
-
-
-_E4M3_MAX = 448.0
-
-
-class _FP8Linear(torch.autograd.Function):
-    """FP8 forward (e4m3, dynamic per-tensor scaling) via torch._scaled_mm, which has no
-    autograd of its own. Backward is bf16 straight-through: the gradient is computed as
-    for the un-quantized linear. This is deliberate — a hand-rolled FP8 backward has
-    fragile layout requirements and a silent-wrong-gradient bug would corrupt every
-    experiment, which is far worse than leaving ~1/3 of the matmul FLOPs in bf16."""
-
-    @staticmethod
-    def forward(ctx, x2, weight):     # x2: (M, in), weight: (out, in)
-        ctx.save_for_backward(x2, weight)
-        sx = (x2.abs().amax().float() / _E4M3_MAX).clamp(min=1e-12)
-        sw = (weight.abs().amax().float() / _E4M3_MAX).clamp(min=1e-12)
-        x8 = (x2 / sx).to(torch.float8_e4m3fn)
-        w8 = (weight / sw).to(torch.float8_e4m3fn)
-        return torch._scaled_mm(x8, w8.t(), scale_a=sx, scale_b=sw, out_dtype=x2.dtype)
-
-    @staticmethod
-    def backward(ctx, g):             # g: (M, out)
-        x2, weight = ctx.saved_tensors
-        gx = g @ weight if ctx.needs_input_grad[0] else None          # (M, in)
-        gw = g.transpose(0, 1) @ x2 if ctx.needs_input_grad[1] else None  # (out, in)
-        return gx, gw
-
+# All large matmuls go through mm8 (a thin F.linear wrapper). The name is kept as the
+# single seam where a custom (e.g. FP8) GEMM could be slotted in later.
 
 def mm8(x, weight):
-    """x @ weight.T (weight is (out, in)). FP8 forward when enabled + on CUDA + dims
-    16-aligned; otherwise plain bf16 F.linear (so default runs are unchanged)."""
-    if not _FP8_ENABLED or not x.is_cuda:
-        return F.linear(x, weight)
-    out_features, in_features = weight.shape
-    x2 = x.reshape(-1, in_features)
-    if x2.shape[0] % 16 != 0 or in_features % 16 != 0 or out_features % 16 != 0:
-        return F.linear(x, weight)
-    return _FP8Linear.apply(x2, weight).reshape(*x.shape[:-1], out_features)
+    """x @ weight.T, weight is (out, in)."""
+    return F.linear(x, weight)
 
 
 # -----------------------------------------------------------------------------
@@ -1151,7 +1108,6 @@ def train_one(config, train_data, val_data, seed, device):
     torch.manual_seed(seed)
     gen_tr  = torch.Generator().manual_seed(seed)
     gen_val = torch.Generator().manual_seed(seed + 10_000)
-    set_fp8(config.get("fp8", False))   # opt-in FP8 matmuls (set before compile)
 
     model = GPT(
         vocab_size=config["vocab_size"],
@@ -1441,10 +1397,6 @@ def main():
     ap.add_argument("--out",        type=str,   default="experiments/arch_search/results_phase2.json")
     ap.add_argument("--device",     type=str,   default=None)
     ap.add_argument("--compile",    action="store_true")
-    ap.add_argument("--fp8", action="store_true",
-                    help="use FP8 (e4m3, dynamic per-tensor scaling) for the big matmuls "
-                         "(attention/MLP/lm_head/conv-branch). ~2x on Blackwell tensor cores and "
-                         "closer to the record's precision. Off = bf16 (default; runs stay comparable).")
     ap.add_argument("--compile-mode", type=str, default="default",
                     choices=["default", "reduce-overhead", "max-autotune"],
                     help="torch.compile mode. reduce-overhead = CUDA graphs (cuts kernel-launch "
@@ -1494,7 +1446,7 @@ def main():
         muon_lr=args.muon_lr, muon_beta2=args.muon_beta2, muon_ortho=args.muon_ortho,
         act_slope=args.act_slope, act_shift=args.act_shift, act_curv=args.act_curv,
         act_init=args.init, compile=args.compile, compile_mode=args.compile_mode,
-        fp8=args.fp8, target_loss=args.target_loss,
+        target_loss=args.target_loss,
         stop_at_target=args.stop_at_target,
         qk_layernorm=args.qk_layernorm,
         paired_heads=args.paired_heads,
@@ -1572,8 +1524,6 @@ def main():
             key += f"_hr{args.head_rank}"
         if args.no_bigram:
             key += "_nobg"
-        if args.fp8:
-            key += "_fp8"
         if args.qk_layernorm:
             key += "_qkln"
         if args.kv_tied:

@@ -15,3 +15,6 @@ __pycache__/
 
 # internal working doc — kept locally, not part of the public repo
 /SIMPLIFICATION_PLAN.md
+
+# local dev equivalence probe
+/_fingerprint.py
