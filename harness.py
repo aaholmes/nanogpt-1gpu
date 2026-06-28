@@ -634,17 +634,12 @@ class GPT(nn.Module):
             self.skip_convs = nn.ModuleDict({
                 str(layer): ConvBranch(model_dim, skip_conv, model_dim) for layer in self.skip_dsts
             })
-        # Learned logit temperature: scale the logits before the head's softmax/softcap.
-        # RMS-norm removes per-token magnitude, so the model can't be more confident on some
-        # tokens than others; this restores that DOF. 'global' = one scalar; 'adaptive' = a
-        # per-token scale from the hidden state. exp() keeps it positive; init -> 1 (no-op).
+        # Optional learned global logit temperature (one scalar). RMS-norm removes per-token
+        # magnitude, so the model can't scale its confidence; this restores that scalar DOF.
+        # exp() keeps it positive; init -> 1 (no-op).
         self.logit_temp_mode = logit_temp
         if logit_temp == "global":
             self.logit_temp = nn.Parameter(torch.zeros(()))
-        elif logit_temp == "adaptive":
-            self.temp_head = nn.Linear(model_dim, 1)
-            nn.init.zeros_(self.temp_head.weight)
-            nn.init.zeros_(self.temp_head.bias)
         # Fixed unigram-log-prob bias on the logits: the model starts at the unigram
         # distribution (loss ~7.66) and learns the contextual residual. Precomputed offline
         # (legitimate for the local proxy; a real speedrun would track it online instead).
@@ -806,11 +801,9 @@ class GPT(nn.Module):
         return self._head_ce(x.reshape(-1, x.size(-1)), t_flat)
 
     def _logit_scale(self, x_flat):
-        # None = off; scalar (global) or per-token (adaptive) positive multiplier on the logits.
+        # None = off; a positive scalar multiplier on the logits when 'global'.
         if self.logit_temp_mode == "global":
             return torch.exp(self.logit_temp)
-        if self.logit_temp_mode == "adaptive":
-            return torch.exp(self.temp_head(x_flat))   # (N, 1)
         return None
 
     def _head_logits(self, x):
@@ -1145,13 +1138,7 @@ def train_one(config, train_data, val_data, seed, device):
     model.ce_chunk = config.get("ce_chunk", 0)
     model.softcap  = config.get("softcap", 23.0)
 
-    if config.get("compile"):
-        # reduce-overhead = CUDA graphs, which cut kernel-launch overhead — the dominant
-        # cost on this many-small-ops architecture / low-SM card. Falls back gracefully.
-        cmode = config.get("compile_mode", "default")
-        cmodel = torch.compile(model, mode=cmode) if cmode != "default" else torch.compile(model)
-    else:
-        cmodel = model
+    cmodel = torch.compile(model) if config.get("compile") else model
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  params: {n_params:,}  act={config['activation']}  opt={config.get('optimizer','normuon')}"
           f"{'  compile' if config.get('compile') else ''}")
@@ -1349,10 +1336,9 @@ def main():
                     help="kernel size of a depthwise conv added at attention-SKIP layers (0 = off). "
                          "Those layers have no token mixing; the conv fills that gap cheaply rather "
                          "than duplicating attention.")
-    ap.add_argument("--logit-temp", type=str, default="none", choices=["none", "global", "adaptive"],
-                    help="learned logit temperature before the head. 'global' = one scalar; "
-                         "'adaptive' = a per-token scale from the hidden state (restores the "
-                         "confidence-magnitude DOF that RMS-norm removes). Init = no-op.")
+    ap.add_argument("--logit-temp", type=str, default="none", choices=["none", "global"],
+                    help="learned global logit temperature (one scalar) before the head, "
+                         "restoring the confidence-magnitude DOF that RMS-norm removes. Init = no-op.")
     ap.add_argument("--unigram-bias", action="store_true",
                     help="add a fixed log-unigram bias to the logits, so the model starts at the "
                          "unigram distribution (~7.66) and learns the contextual residual. "
@@ -1397,10 +1383,6 @@ def main():
     ap.add_argument("--out",        type=str,   default="experiments/arch_search/results_phase2.json")
     ap.add_argument("--device",     type=str,   default=None)
     ap.add_argument("--compile",    action="store_true")
-    ap.add_argument("--compile-mode", type=str, default="default",
-                    choices=["default", "reduce-overhead", "max-autotune"],
-                    help="torch.compile mode. reduce-overhead = CUDA graphs (cuts kernel-launch "
-                         "overhead, the main cost on this low-SM/many-small-ops setup).")
     ap.add_argument("--target-loss",type=float, default=None)
     ap.add_argument("--max-seconds", type=float, default=None,
                     help="wall-clock training budget in seconds. Cosine LR decays over "
@@ -1445,7 +1427,7 @@ def main():
         optimizer=args.optimizer,
         muon_lr=args.muon_lr, muon_beta2=args.muon_beta2, muon_ortho=args.muon_ortho,
         act_slope=args.act_slope, act_shift=args.act_shift, act_curv=args.act_curv,
-        act_init=args.init, compile=args.compile, compile_mode=args.compile_mode,
+        act_init=args.init, compile=args.compile,
         target_loss=args.target_loss,
         stop_at_target=args.stop_at_target,
         qk_layernorm=args.qk_layernorm,
