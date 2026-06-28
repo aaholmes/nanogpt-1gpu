@@ -288,13 +288,6 @@ class Yarn(nn.Module):
         self.attn_scale = 0.1  # from train_gpt.py, inspired by @leloykun
 
 
-# Speedrun layer topology — the legacy L=11 record structure lives in
-# topology.legacy_topology(); topology.build_topology() generates depth/skip
-# variants for architecture search. The GPT model derives all per-layer indexing
-# from a topology dict (default = legacy), so num_layers and the skip/backout
-# pattern are no longer hardcoded.
-from topology import legacy_topology, build_topology, validate_topology  # noqa: E402
-
 # Legacy constants kept for reference / back-compat with older scripts.
 KEY_OFFSET_LAYERS  = {3, 10}
 PAIRED_HEAD_LAYERS = {0, 2, 5, 9}
@@ -525,15 +518,21 @@ class GPT(nn.Module):
                  paired_heads=False, kv_tied=False, v_identity=False, drop_o=False,
                  qkv_conv=0, qkv_conv_where="qkv", conv_branch=0, conv_branch_hidden=0,
                  conv_tower=0, conv_tower_kernel=4, conv_tower_width=0, conv_tower_mode="off",
-                 skip_conv=0, logit_temp="none", unigram_bias=False, head_rank=0, topology=None):
+                 skip_conv=0, logit_temp="none", unigram_bias=False, head_rank=0):
         super().__init__()
-        # Topology: default = exact legacy L=11 record structure (parity-preserving).
-        # A passed-in topology dict (from topology.build_topology) enables depth/skip
-        # search. All per-layer indexing below is derived from it.
-        topo = topology if topology is not None else legacy_topology()
-        validate_topology(topo)
-        assert topo["num_layers"] == num_layers, \
-            f"topology num_layers {topo['num_layers']} != requested {num_layers}"
+        # The L=11 record topology. All per-layer indexing below is derived from it:
+        # layer 6 drops attention (skip 6<-3); backout subtracts from layer 7.
+        topo = dict(
+            num_layers=11,
+            skips={6: 3},                       # dst -> src ; layer 6 drops attention
+            backout_src=7,
+            backout_mode="freeze_subtract",
+            paired_layers={0, 2, 5, 9},
+            ve_layers=[1, 2, 8, 9, 10],         # ordered: maps to VE banks 0..4
+            key_offset_layers={3, 10},
+            attn_layers=[i for i in range(11) if i != 6],
+        )
+        assert num_layers == 11, "this harness is the L=11 record topology"
         self.topo          = topo
         self.skips         = dict(topo["skips"])              # dst -> src
         self.skip_dsts     = set(topo["skips"].keys())
@@ -1126,7 +1125,6 @@ def train_one(config, train_data, val_data, seed, device):
         logit_temp=config.get("logit_temp", "none"),
         unigram_bias=config.get("unigram_bias", False),
         head_rank=config.get("head_rank", 0),
-        topology=config.get("topology"),
     ).to(device)
     model.ce_chunk = config.get("ce_chunk", 0)
     model.softcap  = config.get("softcap", 23.0)
@@ -1344,21 +1342,8 @@ def main():
                     help="replace the always-on RMSNorm QK-norm with LayerNorm(bias=False), "
                          "which also removes the mean (zero-centered). Tests whether the DC "
                          "direction matters beyond scale normalization for Muon conditioning.")
-    # Generative topology (architecture search). When any is given, phase2 builds
-    # a topology via topology.build_topology() instead of the legacy default.
     ap.add_argument("--num-layers",     type=int,   default=None,
-                    help="override depth (number of transformer layers).")
-    ap.add_argument("--num-skips",      type=int,   default=None,
-                    help="number of forward skip connections (each dst drops attention).")
-    ap.add_argument("--skip-src-frac",  type=float, default=None,
-                    help="first skip source as a fraction of depth (legacy 0.30).")
-    ap.add_argument("--skip-span-frac", type=float, default=None,
-                    help="skip span (dst-src) as a fraction of depth (legacy 0.30).")
-    ap.add_argument("--backout-src-frac", type=float, default=None,
-                    help="backout source layer as a fraction of depth (legacy 0.70).")
-    ap.add_argument("--backout-mode",   type=str,   default=None,
-                    choices=["none", "freeze_only", "freeze_subtract"],
-                    help="backout behaviour (legacy freeze_subtract).")
+                    help="depth (must be 11 for the record topology).")
     ap.add_argument("--model-dim",  type=int,   default=None,
                     help="override model/residual width. num_heads*head_dim must equal it.")
     ap.add_argument("--num-heads",  type=int,   default=None,
@@ -1394,19 +1379,8 @@ def main():
     if args.num_heads:  cfg["num_heads"]   = args.num_heads
     if args.head_dim:   cfg["head_dim"]    = args.head_dim
 
-    # Generative topology: build one when any topology arg is provided.
-    _topo_args = (args.num_layers, args.num_skips, args.skip_src_frac,
-                  args.skip_span_frac, args.backout_src_frac, args.backout_mode)
-    if any(a is not None for a in _topo_args):
-        if args.num_layers:
-            cfg["num_layers"] = args.num_layers
-        tparams = {}
-        if args.num_skips      is not None: tparams["num_skips"]       = args.num_skips
-        if args.skip_src_frac  is not None: tparams["skip_src_frac"]   = args.skip_src_frac
-        if args.skip_span_frac is not None: tparams["skip_span_frac"]  = args.skip_span_frac
-        if args.backout_src_frac is not None: tparams["backout_src_frac"] = args.backout_src_frac
-        if args.backout_mode   is not None: tparams["backout_mode"]    = args.backout_mode
-        cfg["topology"] = build_topology(cfg["num_layers"], tparams)
+    if args.num_layers:
+        cfg["num_layers"] = args.num_layers
     assert cfg["num_heads"] * cfg["head_dim"] == cfg["model_dim"], \
         f"num_heads*head_dim ({cfg['num_heads']}*{cfg['head_dim']}) must equal " \
         f"model_dim ({cfg['model_dim']}); head_dim must be divisible by 4 for RoPE"
@@ -1509,7 +1483,7 @@ def main():
             all_results[key].append(log)
             Path(args.out).parent.mkdir(parents=True, exist_ok=True)
             with open(args.out, "w") as f:
-                # topology dicts contain sets (paired/key-offset layers) → sorted lists
+                # serialize any sets (e.g. layer-index sets) as sorted lists
                 json.dump(all_results, f, indent=2,
                           default=lambda o: sorted(o) if isinstance(o, set) else str(o))
     print(f"\nSaved to {args.out}")
