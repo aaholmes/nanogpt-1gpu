@@ -298,84 +298,9 @@ VE_LAYERS          = {1, 2, 8, 9, 10}
 # -----------------------------------------------------------------------------
 # Causal Self-Attention (SDPA-based, replaces FA3)
 
-class DepthwiseCausalConv1d(nn.Module):
-    """Per-channel (depthwise) causal 1-D conv over the time axis, shape (B, T, C).
-
-    Each channel gets its own length-k kernel, left-padded by k-1 so position t sees
-    only t-k+1 .. t (strictly causal). Identity-init (last tap = 1) so it starts as a
-    no-op. Applied to q/k/v BEFORE QK-norm and RoPE — conv-before-rotary, the sane
-    ordering (conv-after-rotary would mix rotated coordinates across time)."""
-
-    def __init__(self, dim, kernel_size):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.conv = nn.Conv1d(dim, dim, kernel_size, groups=dim, bias=False)
-        with torch.no_grad():
-            self.conv.weight.zero_()
-            self.conv.weight[:, :, -1] = 1.0
-
-    def forward(self, x):
-        x = x.transpose(1, 2)                          # (B, C, T)
-        x = F.pad(x, (self.kernel_size - 1, 0))        # causal left-pad
-        # contiguous: the paired-head path downstream does strided .view()s that
-        # reject the transpose's non-contiguous output.
-        return self.conv(x).transpose(1, 2).contiguous()   # (B, T, C)
-
-
-class ConvBranch(nn.Module):
-    """Parallel local-mixing branch, run alongside attention and summed into the residual:
-        out = scale * fc_out( relu2( dwconv( fc_in(x) ) ) )
-    Unlike the in-series q/k/v conv (which can only act THROUGH attention's value
-    aggregation), this is an independent path: even with attention removed it can learn
-    local structure — n-gram-like "which word-types follow which" — leaving attention to
-    handle global meaning. The pointwise fc_in/fc_out give the cross-channel mixing that
-    a pure depthwise conv lacks (needed to relate word-types, not just smooth channels).
-
-    Init = LayerScale, not ReZero: fc_in/fc_out are variance-matched (normal init) and the
-    branch is gated by a small learnable per-channel `scale` (init 0.1). So at step 0 the
-    branch is a *small* well-scaled perturbation (~2% of the residual), not dead zero —
-    every weight gets gradient immediately (no one-step starvation), while the gain still
-    lets the model dial the branch up or down. Matrices are Muon-trained; `scale` is a 1D
-    AdamW param. The depthwise kernel (C,1,K) isn't a 2D matrix, so it goes to AdamW."""
-
-    def __init__(self, model_dim, kernel, hidden, layerscale_init=0.1):
-        super().__init__()
-        b_in  = (3 ** 0.5) * 0.5 * model_dim ** -0.5
-        b_out = (3 ** 0.5) * 0.5 * hidden ** -0.5
-        self.fc_in  = nn.Linear(model_dim, hidden, bias=False)
-        self.dwconv = DepthwiseCausalConv1d(hidden, kernel)
-        self.fc_out = nn.Linear(hidden, model_dim, bias=False)
-        with torch.no_grad():
-            self.fc_in.weight.uniform_(-b_in, b_in)
-            self.fc_out.weight.uniform_(-b_out, b_out)   # variance-matched, NOT zero
-        self.scale = nn.Parameter(layerscale_init * torch.ones(model_dim))
-
-    def forward(self, x):
-        return self.scale * mm8(F.relu(self.dwconv(mm8(x, self.fc_in.weight))).square(), self.fc_out.weight)
-
-
-class ConvTower(nn.Module):
-    """Transformer-free local-only body: embedded tokens -> a stack of residual causal-conv
-    blocks -> final hidden state. The causal conv gives it position implicitly (no RoPE).
-    Used as a parallel product-of-experts track alongside the transformer, or standalone
-    (the conv-only baseline). Blocks use full-strength residuals (LayerScale 1.0); the whole
-    tower's contribution is gated by an outer learnable mix when combined with the transformer."""
-
-    def __init__(self, model_dim, n_blocks, kernel, hidden):
-        super().__init__()
-        self.blocks = nn.ModuleList([
-            ConvBranch(model_dim, kernel, hidden, layerscale_init=1.0) for _ in range(n_blocks)
-        ])
-
-    def forward(self, x):
-        for blk in self.blocks:
-            x = x + blk(norm(x))
-        return norm(x)
-
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, model_dim, num_heads, head_dim, qk_layernorm=False,
-                 kv_tied=False, v_identity=False, drop_o=False, qkv_conv=0, qkv_conv_where="qkv"):
+                 kv_tied=False, v_identity=False, drop_o=False):
         super().__init__()
         assert not (kv_tied and v_identity), "kv_tied and v_identity are mutually exclusive"
         self.num_heads  = num_heads
@@ -384,16 +309,6 @@ class CausalSelfAttention(nn.Module):
         self.kv_tied    = kv_tied
         self.v_identity = v_identity
         self.drop_o     = drop_o
-        # Short depthwise causal conv before norm/RoPE (kernel qkv_conv; 0=off). qkv_conv_where
-        # selects which projections get a conv: 'qkv' all, 'v' value-only, 'qk' query/key-only.
-        # V-only is the cleanest test of content-smoothing: RoPE never touches V, and conv on V
-        # avoids blurring the Q/K addressing. A projection's conv is None when not selected;
-        # v_conv is also None when V is derived (kv_tied/v_identity) and so can't be convolved.
-        self.qkv_conv = qkv_conv
-        mk = lambda sel: DepthwiseCausalConv1d(self.hdim, qkv_conv) if (qkv_conv and sel) else None
-        self.q_conv = mk("q" in qkv_conv_where)
-        self.k_conv = mk("k" in qkv_conv_where)
-        self.v_conv = mk(("v" in qkv_conv_where) and not (kv_tied or v_identity))
         std   = 0.5 * model_dim ** -0.5
         bound = (3 ** 0.5) * std
         if kv_tied or v_identity:
@@ -428,18 +343,13 @@ class CausalSelfAttention(nn.Module):
         if self.kv_tied or self.v_identity:
             qk = mm8(x, sa_lambdas[0] * self.qk.weight)
             q, k = qk.chunk(2, dim=-1)
-            if self.q_conv is not None: q = self.q_conv(q)
-            if self.k_conv is not None: k = self.k_conv(k)
             q = q.view(B, T, H, D)
             k = k.view(B, T, H, D)
-            # V comes from K (before QK-norm/RoPE; inherits the K conv) or from the input
+            # V comes from K (before QK-norm/RoPE) or from the input
             v = k.clone() if self.kv_tied else x.view(B, T, H, D)
         else:
             qkv = mm8(x, sa_lambdas[0] * self.qkv.weight)
             q, k, v = qkv.chunk(3, dim=-1)
-            if self.q_conv is not None: q = self.q_conv(q)
-            if self.k_conv is not None: k = self.k_conv(k)
-            if self.v_conv is not None: v = self.v_conv(v)
             q = q.view(B, T, H, D)
             k = k.view(B, T, H, D)
             v = v.view(B, T, H, D)
@@ -516,9 +426,7 @@ class GPT(nn.Module):
                  max_seq_len, device, act_name="relu2", act_init="gelu_minimax",
                  act_slope=0.0, act_shift=0.0, act_curv=1.0, qk_layernorm=False,
                  paired_heads=False, kv_tied=False, v_identity=False, drop_o=False,
-                 qkv_conv=0, qkv_conv_where="qkv", conv_branch=0, conv_branch_hidden=0,
-                 conv_tower=0, conv_tower_kernel=4, conv_tower_width=0, conv_tower_mode="off",
-                 skip_conv=0, logit_temp="none", unigram_bias=False, head_rank=0):
+                 logit_temp="none", unigram_bias=False, head_rank=0):
         super().__init__()
         # The L=11 record topology. All per-layer indexing below is derived from it:
         # layer 6 drops attention (skip 6<-3); backout subtracts from layer 7.
@@ -615,23 +523,11 @@ class GPT(nn.Module):
         self.attn_modules = nn.ModuleList([
             CausalSelfAttention(model_dim, num_heads, head_dim,
                                 qk_layernorm=qk_layernorm,
-                                kv_tied=kv_tied, v_identity=v_identity, drop_o=drop_o,
-                                qkv_conv=qkv_conv, qkv_conv_where=qkv_conv_where)
+                                kv_tied=kv_tied, v_identity=v_identity, drop_o=drop_o)
             for _ in attn_layers_topo
         ])
         self._attn_layer_idx = {layer: j for j, layer in enumerate(attn_layers_topo)}
 
-        # Parallel conv branch (Conformer-style), one per attention layer, summed into the
-        # residual alongside attention. conv_branch = kernel size (0 = off); hidden defaults
-        # to model_dim. Independent of attention; LayerScale-gated (small at init, not dead).
-        # Skip-layer conv: at layers where attention is SKIPPED (no token mixing of their
-        # own), add a depthwise-conv local-mixing block — fills the gap cheaply rather than
-        # duplicating attention. One ConvBranch per skip-destination layer (kernel = skip_conv).
-        self.skip_conv = skip_conv
-        if skip_conv:
-            self.skip_convs = nn.ModuleDict({
-                str(layer): ConvBranch(model_dim, skip_conv, model_dim) for layer in self.skip_dsts
-            })
         # Optional learned global logit temperature (one scalar). RMS-norm removes per-token
         # magnitude, so the model can't scale its confidence; this restores that scalar DOF.
         # exp() keeps it positive; init -> 1 (no-op).
@@ -647,25 +543,6 @@ class GPT(nn.Module):
             self.register_buffer("unigram_bias", torch.from_numpy(lp.astype(np.float32)))
         else:
             self.unigram_bias = None
-        # Parallel conv tower (embeddings -> conv stack -> hidden), combined with the
-        # transformer per conv_tower_mode: 'shared' adds hidden states (one head),
-        # 'separate' is a true product-of-experts (own head), 'alone' skips the transformer.
-        self.conv_tower_blocks = conv_tower
-        self.conv_tower_mode = conv_tower_mode
-        if conv_tower:
-            self.conv_tower = ConvTower(model_dim, conv_tower, conv_tower_kernel,
-                                        conv_tower_width or model_dim)
-            self.conv_mix = nn.Parameter(torch.tensor(0.1))   # learnable track mix (shared/separate)
-            if conv_tower_mode == "separate":
-                self.conv_head = nn.Linear(model_dim, self.vocab_size, bias=False)
-                with torch.no_grad():
-                    self.conv_head.weight.uniform_(-bound, bound)
-        self.conv_branch = conv_branch
-        if conv_branch:
-            cb_hidden = conv_branch_hidden or model_dim
-            self.conv_branches = nn.ModuleList([
-                ConvBranch(model_dim, conv_branch, cb_hidden) for _ in attn_layers_topo
-            ])
 
         # Per-layer MLP modules
         self.mlp_modules = nn.ModuleList([
@@ -700,10 +577,6 @@ class GPT(nn.Module):
 
         # Embeddings + smear
         x_emb     = self.embed(input_ids)                  # (B, T, model_dim)
-        # conv-only baseline: skip the transformer entirely, predict from the conv tower.
-        if self.conv_tower_blocks and self.conv_tower_mode == "alone":
-            xc = self.conv_tower(x_emb)
-            return self._head_ce(xc.reshape(-1, xc.size(-1)), targets.reshape(-1))
         x0_bigram = self.bigram_embed(bigram_ids)             # (B, T, model_dim)
         smear_out = smear_lambda * torch.sigmoid(
             self.smear_gate(x_emb[:, 1:, :12])            # (B, T-1, 1)
@@ -748,9 +621,6 @@ class GPT(nn.Module):
             if i in self.skip_dsts:
                 # No attention; inject the saved skip-source activation in its place
                 x = x + skip_gate_out * skip_store[self.skips[i]]
-                if self.skip_conv:
-                    # Fill the no-token-mixing gap with cheap local convolution.
-                    x = x + self.skip_convs[str(i)](norm(x))
             else:
                 attn_mod  = self.attn_modules[self._attn_layer_idx[i]]
                 # Backout: once frozen, later attention layers read the frozen state
@@ -761,10 +631,6 @@ class GPT(nn.Module):
                     attn_gate_w=attn_gw, ve=ve_i, ve_gate_w=ve_gw, key_offset=key_off
                 )
                 x = rl_attn[i] * x + pl_attn[i] * attn_out + x0_inject[i]
-                if self.conv_branch:
-                    # Parallel local-mixing branch on the SAME normed input as attention,
-                    # added independently to the residual (LayerScale-gated, small at init).
-                    x = x + self.conv_branches[self._attn_layer_idx[i]](n_in)
 
             mlp_out = self.mlp_modules[i](norm(x))
             x = rl_mlp[i] * x + pl_mlp[i] * mlp_out
@@ -780,17 +646,7 @@ class GPT(nn.Module):
             x = x - backout_lambda * x_backout
         x = norm(x)
 
-        # Combine the conv tower with the transformer (if enabled): 'shared' adds the
-        # conv hidden state (one head); 'separate' is a product of experts via its own head.
         t_flat = targets.reshape(-1)
-        if self.conv_tower_blocks and self.conv_tower_mode == "shared":
-            # Re-normalize after adding the tower so the head input is scale-matched to the
-            # baseline. Without this, the un-normed sum lets the model inflate logit magnitude
-            # and game the fixed softcap (an artifact, not a real gain).
-            x = norm(x + self.conv_mix * self.conv_tower(x_emb))
-        if self.conv_tower_blocks and self.conv_tower_mode == "separate":
-            xc = self.conv_tower(x_emb)
-            return self._ce_two_head(x.reshape(-1, x.size(-1)), xc.reshape(-1, xc.size(-1)), t_flat)
         return self._head_ce(x.reshape(-1, x.size(-1)), t_flat)
 
     def _logit_scale(self, x_flat):
@@ -820,22 +676,6 @@ class GPT(nn.Module):
         if self.softcap and self.softcap > 0:
             logits = self.softcap * torch.sigmoid((logits + 5) / 7.5)
         return F.cross_entropy(logits, t_flat)
-
-    def _ce_two_head(self, xt_flat, xc_flat, t_flat):
-        # Product of experts: logits = lm_head(h_T) + mix * conv_head(h_C), softcapped, chunked.
-        chunk = self.ce_chunk if (self.ce_chunk and self.ce_chunk > 0) else xt_flat.size(0)
-        n = t_flat.size(0)
-        total = xt_flat.new_zeros(())
-        def _chunk_loss(xt_c, xc_c, t_c):
-            logits = mm8(xt_c, self.lm_head.weight) + self.conv_mix * mm8(xc_c, self.conv_head.weight)
-            if self.softcap and self.softcap > 0:
-                logits = self.softcap * torch.sigmoid((logits + 5) / 7.5)
-            return F.cross_entropy(logits, t_c, reduction="sum")
-        for i in range(0, n, chunk):
-            total = total + torch.utils.checkpoint.checkpoint(
-                _chunk_loss, xt_flat[i:i+chunk], xc_flat[i:i+chunk], t_flat[i:i+chunk],
-                use_reentrant=False)
-        return total / n
 
     def _chunked_softcap_ce(self, x_flat, targets_flat, chunk, s=None):
         per_pos = s is not None and s.dim() > 0 and s.shape[0] == x_flat.shape[0]
@@ -911,7 +751,7 @@ def build_optimizers(model, config):
             trilu_params.append(p)
         elif p.ndim == 2 and "mlp_modules" in name and "fc_gate" in name:
             mlp_gate_params.append(p)  # gating/selection branch of GatedMLP
-        elif p.ndim == 2 and any(k in name for k in ("attn_modules", "mlp_modules", "conv_branches", "conv_tower", "skip_convs")):
+        elif p.ndim == 2 and any(k in name for k in ("attn_modules", "mlp_modules")):
             matrix_params.append(p)    # value/projection branches + attention + conv-branch/tower/skip pointwise
         elif name in ("scalars", "post_lambdas", "resid_lambdas", "x0_lambdas", "bigram_lambdas"):
             scalar_params.append(p)
@@ -1113,15 +953,6 @@ def train_one(config, train_data, val_data, seed, device):
         kv_tied=config.get("kv_tied", False),
         v_identity=config.get("v_identity", False),
         drop_o=config.get("drop_o", False),
-        qkv_conv=config.get("qkv_conv", 0),
-        qkv_conv_where=config.get("qkv_conv_where", "qkv"),
-        conv_branch=config.get("conv_branch", 0),
-        conv_branch_hidden=config.get("conv_branch_hidden", 0),
-        conv_tower=config.get("conv_tower", 0),
-        conv_tower_kernel=config.get("conv_tower_kernel", 4),
-        conv_tower_width=config.get("conv_tower_width", 0),
-        conv_tower_mode=config.get("conv_tower_mode", "off"),
-        skip_conv=config.get("skip_conv", 0),
         logit_temp=config.get("logit_temp", "none"),
         unigram_bias=config.get("unigram_bias", False),
         head_rank=config.get("head_rank", 0),
@@ -1295,38 +1126,6 @@ def main():
                          "sequence length). Matches train_gpt.py exactly but ~1.5x slower. "
                          "Off by default for local experiments; the activation ranking is "
                          "unlikely to change since paired heads affect attention, not the MLP.")
-    ap.add_argument("--qkv-conv", type=int, default=0,
-                    help="kernel size of a depthwise causal conv on q/k/v, applied before "
-                         "QK-norm and RoPE (0 = off; 3-4 typical). Conformer/Mamba-style local "
-                         "mixing on top of attention; identity-init no-op. NOTE: tiny FLOPs but a "
-                         "non-fused memory-bound op — judge it on loss-at-budget here, not wallclock "
-                         "(the record is wallclock-bound and may not keep a per-step win).")
-    ap.add_argument("--qkv-conv-where", type=str, default="qkv", choices=["qkv", "v", "qk"],
-                    help="which projections the conv is applied to: 'qkv' all (default), "
-                         "'v' value-only (RoPE-free pathway, no addressing blur — the cleanest "
-                         "content-smoothing test), 'qk' query/key-only.")
-    ap.add_argument("--conv-branch", type=int, default=0,
-                    help="kernel size of a PARALLEL conv branch (Conformer-style: pointwise -> "
-                         "depthwise causal conv -> relu2 -> pointwise) run alongside attention and "
-                         "summed into the residual (0 = off). Independent of attention — learns "
-                         "local n-gram-like structure on its own path. No-op at init. Bigger/costlier "
-                         "than --qkv-conv; judge on loss-at-budget.")
-    ap.add_argument("--conv-branch-hidden", type=int, default=0,
-                    help="inner width of the parallel conv branch (0 = model_dim).")
-    ap.add_argument("--conv-tower", type=int, default=0,
-                    help="number of residual conv blocks in a parallel conv tower (0 = off). "
-                         "A transformer-free local-only track combined with the transformer.")
-    ap.add_argument("--conv-tower-kernel", type=int, default=4, help="conv tower kernel size.")
-    ap.add_argument("--conv-tower-width", type=int, default=0, help="conv tower inner width (0 = model_dim).")
-    ap.add_argument("--conv-tower-mode", type=str, default="off",
-                    choices=["off", "shared", "separate", "alone"],
-                    help="how the conv tower combines with the transformer: 'shared' adds hidden "
-                         "states through one lm_head; 'separate' is a product of experts with its "
-                         "own head; 'alone' skips the transformer (conv-only baseline).")
-    ap.add_argument("--skip-conv", type=int, default=0,
-                    help="kernel size of a depthwise conv added at attention-SKIP layers (0 = off). "
-                         "Those layers have no token mixing; the conv fills that gap cheaply rather "
-                         "than duplicating attention.")
     ap.add_argument("--logit-temp", type=str, default="none", choices=["none", "global"],
                     help="learned global logit temperature (one scalar) before the head, "
                          "restoring the confidence-magnitude DOF that RMS-norm removes. Init = no-op.")
@@ -1397,15 +1196,6 @@ def main():
         kv_tied=args.kv_tied,
         v_identity=args.v_identity,
         drop_o=args.drop_o,
-        qkv_conv=args.qkv_conv,
-        qkv_conv_where=args.qkv_conv_where,
-        conv_branch=args.conv_branch,
-        conv_branch_hidden=args.conv_branch_hidden,
-        conv_tower=args.conv_tower,
-        conv_tower_kernel=args.conv_tower_kernel,
-        conv_tower_width=args.conv_tower_width,
-        conv_tower_mode=args.conv_tower_mode,
-        skip_conv=args.skip_conv,
         logit_temp=args.logit_temp,
         unigram_bias=args.unigram_bias,
         head_rank=args.head_rank,
@@ -1451,14 +1241,6 @@ def main():
             key += f"_c{args.act_curv:g}"
         if args.optimizer != "normuon":
             key += f"_{args.optimizer}"
-        if args.qkv_conv:
-            key += f"_qc{args.qkv_conv}{args.qkv_conv_where if args.qkv_conv_where != 'qkv' else ''}"
-        if args.conv_branch:
-            key += f"_cb{args.conv_branch}"
-        if args.conv_tower:
-            key += f"_ct{args.conv_tower}{args.conv_tower_mode[0]}"
-        if args.skip_conv:
-            key += f"_sc{args.skip_conv}"
         if args.logit_temp != "none":
             key += f"_lt{args.logit_temp[0]}"
         if args.unigram_bias:
