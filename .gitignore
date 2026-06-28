@@ -18,3 +18,8 @@ __pycache__/
 
 # local dev equivalence probe
 /_fingerprint.py
+
+# parked: bug story + findings (kept locally, re-addable later)
+/BUGLOG.md
+/figures/
+/results/
