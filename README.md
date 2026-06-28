@@ -1,6 +1,6 @@
 # nanogpt-1gpu
 
-A single-GPU adaptation of the [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) speedrun, for local experimentation and architecture screening on **one consumer GPU (16 GB)**. The speedrun trains a 124M-parameter GPT on FineWeb to 3.28 validation loss as fast as possible on 8×H100 — hardware most people can't rent. This is a faithful-where-it-can-be re-implementation that runs on a single GPU, paired with a methodology built to keep comparisons trustworthy.
+A single-GPU adaptation of the [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) speedrun, for local experimentation and architecture screening on **one consumer GPU (16 GB)**. The speedrun trains a 124M-parameter GPT on FineWeb to 3.28 validation loss as fast as possible on 8×H100 — hardware beyond a typical home setup. This is a faithful-where-it-can-be re-implementation that runs on a single GPU, paired with a methodology built to keep comparisons trustworthy.
 
 It's a research **harness, not a benchmark** — a tool I use to decide what's worth validating on the real thing, not a stable reference for others to adopt. Absolute numbers here don't transfer to the record; the value is in the *rankings* and the *method*.
 
