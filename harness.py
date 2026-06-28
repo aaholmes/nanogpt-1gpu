@@ -1,44 +1,29 @@
 """
-Phase 2: Activation study using the full NanoGPT speedrun architecture (single GPU).
+nanogpt-1gpu: a single-GPU adaptation of the modded-nanogpt speedrun architecture, for
+local experimentation and architecture screening on one consumer GPU.
 
-Starts from record-holder train_gpt.py. Key changes for single-GPU use:
-  - Remove distributed/DDP (world_size=1 assumed)
-  - Replace FA3 (flash_attn_varlen_func) with F.scaled_dot_product_attention
-  - Replace FP8 CastedLinearT with standard nn.Linear
-  - Replace Triton polar_express with pure-PyTorch orthogonalizer (from phase1.py)
-  - Replace ReLUSqrdMLP with swappable activation classes (from phase1.py)
-  - Use simple random batch sampler instead of BOS-aligned distributed loader
-  - Single-stage cosine LR schedule (no multi-stage batch/seqlen ramp)
+Faithful to the record's model -- RoPE/YaRN (half-truncated, half-stationary), value (5
+banks) + bigram embeddings with learned per-layer gates, paired-head attention (layers
+0,2,5,9), key-offset induction (layers 3,10), skip (3->6) and backout (layer 7), always-on
+QK-norm, NorMuon with Polar Express, relu-squared MLP, and a tied output head -- with these
+deliberate single-GPU simplifications:
+  - No distributed/DDP (world_size = 1)
+  - scaled_dot_product_attention instead of FlashAttention-3
+  - bf16 instead of FP8; pure-PyTorch orthogonalizer instead of the Triton kernel
+  - Trapezoidal/WSD LR schedule on a wall-clock budget (single batch/seq-len stage)
+  - Plain cross-entropy (no softcap)
 
-Architecture preserved from train_gpt.py:
-  - RoPE / YaRN (half-truncated, half-stationary)
-  - Paired head layers (0, 2, 5, 9)
-  - Key offset on long-window layers (3, 10) for induction
-  - Value embeddings (5 banks) with learned per-layer gates
-  - Bigram embeddings with learned per-layer lambdas
-  - Learnable residual scalars (resid_lambdas, post_lambdas, x0_lambdas)
-  - Learnable SA lambdas (per-layer Q/K and O scaling)
-  - Smear gate (shift token embed forward 1 position)
-  - Skip connection layer 3 → layer 6
-  - Backout (layer 7 contribution subtracted from final x)
-  - QK-norm always-on (F.rms_norm, matching speedrun)
-  - Attention gate and VE gate
-  - Softcapped cross-entropy (23*sigmoid((logits+5)/7.5))
-
-Experimental note: phase1 vs phase2 baselines are themselves informative.
-Any phase1 result should be re-validated here before claiming relevance to the speedrun.
+Lineage: Andrej Karpathy's nanoGPT / llm.c -> Keller Jordan et al.'s modded-nanogpt.
+See README and LICENSE for credit.
 """
 
 import argparse
 import contextlib
 import json
 import math
-import os
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
@@ -76,7 +61,7 @@ class MLP(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Orthogonalizer (pure PyTorch, from phase1.py — replaces Triton polar_express)
+# Orthogonalizer (pure PyTorch — replaces the record's Triton polar_express kernel)
 
 _POLAR_EXPRESS_COEFFS = [
     (8.156554524902461,  -22.48329292557795,   15.878769915207462),
@@ -782,7 +767,7 @@ def train_one(config, train_data, val_data, seed, device):
             print(f"  step {step:5d}  lr={optimizers[0].param_groups[0]['lr']:.5f}"
                   f"  train={train_loss_val:.4f}  val={val_loss:.4f}  t={elapsed:.1f}s")
             # Opt-in early stop: once the target is crossed, the time-to-target is
-            # already recorded — no need to keep training (used by the BO search).
+            # already recorded — no need to keep training.
             if config.get("stop_at_target") and config.get("target_loss") \
                     and val_loss <= config["target_loss"]:
                 print(f"  -> reached target {config['target_loss']} at step {step}, stopping early")
@@ -809,8 +794,8 @@ def train_one(config, train_data, val_data, seed, device):
 # Configs
 
 CONFIGS = {
-    # phase2.py requires num_layers=11 for the speedrun topology.
-    # "tiny" uses small model_dim for fast sanity checks on a laptop.
+    # num_layers must be 11 (the record topology). "tiny" uses a small model_dim for
+    # fast CPU/laptop sanity checks; "speedrun" matches train_gpt.py's 124M architecture.
     "tiny": dict(
         num_layers=11, model_dim=64, num_heads=4, head_dim=16,
         seq_len=256, batch_size=4,
@@ -876,19 +861,19 @@ def main():
                     help="override per-head dimension. Use with --num-heads to sweep head "
                          "count at fixed model_dim (e.g. 4x192, 6x128, 8x96, 12x64).")
     ap.add_argument("--data-dir",   type=str,   default="data/fineweb10B")
-    ap.add_argument("--out",        type=str,   default="experiments/arch_search/results_phase2.json")
+    ap.add_argument("--out",        type=str,   default="results/run.json")
     ap.add_argument("--device",     type=str,   default=None)
     ap.add_argument("--compile",    action="store_true")
     ap.add_argument("--target-loss",type=float, default=None)
     ap.add_argument("--max-seconds", type=float, default=None,
-                    help="wall-clock training budget in seconds. Cosine LR decays over "
-                         "the budget so the schedule completes; training stops when the "
-                         "budget is exhausted. Use a large --steps so time is the binding "
-                         "constraint. For iso-compute architecture comparison.")
+                    help="wall-clock training budget in seconds. The LR schedule decays over "
+                         "the budget so it completes; training stops when the budget is "
+                         "exhausted. Use a large --steps so time is the binding constraint. "
+                         "For iso-compute architecture comparison.")
     ap.add_argument("--stop-at-target", action="store_true",
                     help="stop training as soon as val loss crosses --target-loss "
-                         "(time-to-target is already recorded). Used by the BO search "
-                         "to avoid wasting compute after the objective is measured.")
+                         "(time-to-target is already recorded), to avoid wasting compute "
+                         "after the objective is measured.")
     args = ap.parse_args()
 
     if args.tiny:
