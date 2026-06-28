@@ -1,0 +1,6 @@
+# Core harness + self-verification
+torch>=2.4
+numpy>=1.24
+
+# Only needed by data/cached_fineweb10B.py (FineWeb shard download)
+huggingface_hub>=0.20

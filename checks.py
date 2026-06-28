@@ -50,3 +50,4 @@ if __name__ == "__main__":
         except Exception as e:
             ok = False; print(f"  FAIL  {name:26} {e}")
     print("ALL CHECKS PASS" if ok else "SOME CHECKS FAILED")
+    sys.exit(0 if ok else 1)

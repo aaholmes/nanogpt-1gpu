@@ -1,4 +1,6 @@
 # nanogpt-1gpu
+<!-- After pushing, enable the CI badge (replace OWNER):
+[![checks](https://github.com/OWNER/nanogpt-1gpu/actions/workflows/checks.yml/badge.svg)](https://github.com/OWNER/nanogpt-1gpu/actions/workflows/checks.yml) -->
 
 A single-GPU adaptation of the [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) speedrun, for local experimentation and architecture screening on **one consumer GPU (16 GB)**. The speedrun trains a 124M-parameter GPT on FineWeb to 3.28 validation loss as fast as possible on 8×H100 — hardware beyond a typical home setup. This is a faithful-where-it-can-be re-implementation that runs on a single GPU, paired with a methodology built to keep comparisons trustworthy.
 
@@ -21,6 +23,8 @@ The point of the repo is a fast screening loop that doesn't lie to you. Cheap, s
 - **Paired comparisons.** Same seed for variant and baseline; test the per-seed differences, not group means.
 - **Matched hyperparameters.** Tune the learning rate per variant before believing an architecture effect — an LR confound is easily mistaken for a win.
 - **Budget stability.** Re-run apparent winners at longer budgets; early leads often fade.
+
+CI runs `python checks.py` on every push (see [`.github/workflows/checks.yml`](.github/workflows/checks.yml)), so the self-verification can't silently regress.
 
 ## How it differs from the speedrun
 
