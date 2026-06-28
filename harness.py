@@ -545,6 +545,15 @@ def build_optimizers(model, config):
         else:
             other_params.append(p)
 
+    # Coverage guarantee: every trainable parameter is routed to exactly one group. A
+    # silently-dropped parameter (the frozen-embedding/head bug class) fails loud here.
+    routed = (matrix_params + mlp_gate_params + scalar_params + gate_params +
+              ve_params + bigram_params + lmhead_params + other_params)
+    routed_ids = {id(p) for p in routed}
+    missing = [n for n, p in model.named_parameters() if p.requires_grad and id(p) not in routed_ids]
+    assert not missing, f"parameters not routed to any optimizer group: {missing}"
+    assert len(routed) == len(routed_ids), "a parameter was routed to more than one optimizer group"
+
     if opt_name in ("normuon", "muon", "hybrid", "hybrid-muon"):
         # ── NorMuon / Muon path ──────────────────────────────────────────────
         # Matrix weights → Muon/NorMuon. Everything else → AdamW with
