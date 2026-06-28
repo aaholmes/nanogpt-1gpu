@@ -12,10 +12,6 @@ CFG_OPT = {'optimizer':'normuon','muon_lr':0.02,'adam_lr':0.008,'adam_wd':0.0,'m
 
 ARMS = {
     'baseline (relu2, tied)': dict(),
-    'logit-temp global':      dict(logit_temp='global'),
-    'unigram-bias':           dict(unigram_bias=True),
-    'head-rank 64 (low-rank)':dict(head_rank=64),
-    'head-rank -1 (untie)':   dict(head_rank=-1),
 }
 
 def build(**kw):

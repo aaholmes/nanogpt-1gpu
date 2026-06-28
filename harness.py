@@ -303,8 +303,7 @@ def next_multiple_of_n(v, n):
 class GPT(nn.Module):
     def __init__(self, vocab_size, num_layers, num_heads, head_dim, model_dim,
                  max_seq_len, device, qk_layernorm=False,
-                 paired_heads=False, kv_tied=False, v_identity=False, drop_o=False,
-                 logit_temp="none", unigram_bias=False, head_rank=0):
+                 paired_heads=False, kv_tied=False, v_identity=False, drop_o=False):
         super().__init__()
         # The L=11 record topology. All per-layer indexing below is derived from it:
         # layer 6 drops attention (skip 6<-3); backout subtracts from layer 7.
@@ -354,16 +353,6 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(model_dim, self.vocab_size, bias=False)
         nn.init.normal_(self.embed.weight, std=0.005)
         self.lm_head.weight = self.embed.weight  # tied
-        # Head parameterization: 0 = tied (above); r>0 = tied base + rank-r LoRA-style offset
-        # (W_out = embed + up@down, init offset 0 so it starts tied); -1 = full untie.
-        self.head_rank = head_rank
-        if head_rank and head_rank > 0:
-            _rng = torch.get_rng_state()   # restore after, so the body init is identical across head modes
-            self.head_lr_down = nn.Parameter(torch.empty(head_rank, model_dim).normal_(std=0.02))
-            torch.set_rng_state(_rng)
-            self.head_lr_up   = nn.Parameter(torch.zeros(self.vocab_size, head_rank))  # offset=0 at init
-        elif head_rank == -1:
-            self.lm_head.weight = nn.Parameter(self.embed.weight.detach().clone())  # untie; starts equal
 
         # Smear and skip gates (zero-init → neutral at start)
         self.smear_gate = nn.Linear(12, 1, bias=False)
@@ -405,22 +394,6 @@ class GPT(nn.Module):
             for _ in attn_layers_topo
         ])
         self._attn_layer_idx = {layer: j for j, layer in enumerate(attn_layers_topo)}
-
-        # Optional learned global logit temperature (one scalar). RMS-norm removes per-token
-        # magnitude, so the model can't scale its confidence; this restores that scalar DOF.
-        # exp() keeps it positive; init -> 1 (no-op).
-        self.logit_temp_mode = logit_temp
-        if logit_temp == "global":
-            self.logit_temp = nn.Parameter(torch.zeros(()))
-        # Fixed unigram-log-prob bias on the logits: the model starts at the unigram
-        # distribution (loss ~7.66) and learns the contextual residual. Precomputed offline
-        # (legitimate for the local proxy; a real speedrun would track it online instead).
-        if unigram_bias:
-            lp = np.load("unigram_logprobs.npy")
-            assert lp.shape[0] == self.vocab_size, f"bias len {lp.shape[0]} != vocab {self.vocab_size}"
-            self.register_buffer("unigram_bias", torch.from_numpy(lp.astype(np.float32)))
-        else:
-            self.unigram_bias = None
 
         # Per-layer MLP modules
         self.mlp_modules = nn.ModuleList([
@@ -526,48 +499,21 @@ class GPT(nn.Module):
         t_flat = targets.reshape(-1)
         return self._head_ce(x.reshape(-1, x.size(-1)), t_flat)
 
-    def _logit_scale(self, x_flat):
-        # None = off; a positive scalar multiplier on the logits when 'global'.
-        if self.logit_temp_mode == "global":
-            return torch.exp(self.logit_temp)
-        return None
-
-    def _head_logits(self, x):
-        # Base (tied or untied) logits, plus the rank-r head offset when head_rank > 0.
-        logits = mm8(x, self.lm_head.weight)
-        if self.head_rank and self.head_rank > 0:
-            logits = logits + (x @ self.head_lr_down.t()) @ self.head_lr_up.t()
-        return logits
-
     def _head_ce(self, x_flat, t_flat):
-        # Plain cross-entropy through the (shared) lm_head; chunked to avoid materializing the
+        # Plain cross-entropy through the tied lm_head; chunked to avoid materializing the
         # full (B*T, vocab) logit tensor.
-        s = self._logit_scale(x_flat)
         if self.ce_chunk and self.ce_chunk > 0:
-            return self._chunked_ce(x_flat, t_flat, self.ce_chunk, s)
-        logits = self._head_logits(x_flat)
-        if s is not None:
-            logits = s * logits
-        if self.unigram_bias is not None:
-            logits = logits + self.unigram_bias
-        return F.cross_entropy(logits, t_flat)
+            return self._chunked_ce(x_flat, t_flat, self.ce_chunk)
+        return F.cross_entropy(mm8(x_flat, self.lm_head.weight), t_flat)
 
-    def _chunked_ce(self, x_flat, targets_flat, chunk, s=None):
-        per_pos = s is not None and s.dim() > 0 and s.shape[0] == x_flat.shape[0]
-        def _chunk_loss(x_c, t_c, s_c):
-            logits = self._head_logits(x_c)
-            if s_c is not None:
-                logits = s_c * logits
-            if self.unigram_bias is not None:
-                logits = logits + self.unigram_bias
-            return F.cross_entropy(logits, t_c, reduction="sum")
+    def _chunked_ce(self, x_flat, targets_flat, chunk):
+        def _chunk_loss(x_c, t_c):
+            return F.cross_entropy(mm8(x_c, self.lm_head.weight), t_c, reduction="sum")
         n = x_flat.size(0)
         total = x_flat.new_zeros(())
         for i in range(0, n, chunk):
-            s_c = (s[i:i+chunk] if per_pos else s)
             total = total + torch.utils.checkpoint.checkpoint(
-                _chunk_loss, x_flat[i:i+chunk], targets_flat[i:i+chunk], s_c,
-                use_reentrant=False)
+                _chunk_loss, x_flat[i:i+chunk], targets_flat[i:i+chunk], use_reentrant=False)
         return total / n
 
 
@@ -815,9 +761,6 @@ def train_one(config, train_data, val_data, seed, device):
         kv_tied=config.get("kv_tied", False),
         v_identity=config.get("v_identity", False),
         drop_o=config.get("drop_o", False),
-        logit_temp=config.get("logit_temp", "none"),
-        unigram_bias=config.get("unigram_bias", False),
-        head_rank=config.get("head_rank", 0),
     ).to(device)
     model.ce_chunk = config.get("ce_chunk", 0)
 
@@ -968,17 +911,6 @@ def main():
                          "sequence length). Matches train_gpt.py exactly but ~1.5x slower. "
                          "Off by default for local experiments; the activation ranking is "
                          "unlikely to change since paired heads affect attention, not the MLP.")
-    ap.add_argument("--logit-temp", type=str, default="none", choices=["none", "global"],
-                    help="learned global logit temperature (one scalar) before the head, "
-                         "restoring the confidence-magnitude DOF that RMS-norm removes. Init = no-op.")
-    ap.add_argument("--unigram-bias", action="store_true",
-                    help="add a fixed log-unigram bias to the logits, so the model starts at the "
-                         "unigram distribution (~7.66) and learns the contextual residual. "
-                         "Loads unigram_logprobs.npy.")
-    ap.add_argument("--head-rank", type=int, default=0,
-                    help="output-head parameterization: 0 = tied to embedding (default); r>0 = tied "
-                         "base + rank-r learned offset (cheap partial untie, starts tied); "
-                         "-1 = full untie (separate lm_head, ~38M extra params).")
     ap.add_argument("--qk-layernorm", action="store_true",
                     help="replace the always-on RMSNorm QK-norm with LayerNorm(bias=False), "
                          "which also removes the mean (zero-centered). Tests whether the DC "
@@ -1037,9 +969,6 @@ def main():
         kv_tied=args.kv_tied,
         v_identity=args.v_identity,
         drop_o=args.drop_o,
-        logit_temp=args.logit_temp,
-        unigram_bias=args.unigram_bias,
-        head_rank=args.head_rank,
         ce_chunk=args.ce_chunk,
         max_seconds=args.max_seconds,
     ))
@@ -1069,9 +998,6 @@ def main():
     # Run key encodes the non-default screening axes, so results accumulate per-config.
     key = "run"
     if args.optimizer != "normuon":     key += f"_{args.optimizer}"
-    if args.logit_temp != "none":       key += f"_lt{args.logit_temp[0]}"
-    if args.unigram_bias:               key += "_ub"
-    if args.head_rank:                  key += f"_hr{args.head_rank}"
     if args.qk_layernorm:               key += "_qkln"
     if args.kv_tied:                    key += "_kv"
     if args.v_identity:                 key += "_vI"
