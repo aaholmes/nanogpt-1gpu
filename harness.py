@@ -525,7 +525,7 @@ class GPT(nn.Module):
                  paired_heads=False, kv_tied=False, v_identity=False, drop_o=False,
                  qkv_conv=0, qkv_conv_where="qkv", conv_branch=0, conv_branch_hidden=0,
                  conv_tower=0, conv_tower_kernel=4, conv_tower_width=0, conv_tower_mode="off",
-                 skip_conv=0, logit_temp="none", unigram_bias=False, head_rank=0, no_bigram=False, topology=None):
+                 skip_conv=0, logit_temp="none", unigram_bias=False, head_rank=0, topology=None):
         super().__init__()
         # Topology: default = exact legacy L=11 record structure (parity-preserving).
         # A passed-in topology dict (from topology.build_topology) enables depth/skip
@@ -625,7 +625,6 @@ class GPT(nn.Module):
         # Parallel conv branch (Conformer-style), one per attention layer, summed into the
         # residual alongside attention. conv_branch = kernel size (0 = off); hidden defaults
         # to model_dim. Independent of attention; LayerScale-gated (small at init, not dead).
-        self.no_bigram = no_bigram
         # Skip-layer conv: at layers where attention is SKIPPED (no token mixing of their
         # own), add a depthwise-conv local-mixing block — fills the gap cheaply rather than
         # duplicating attention. One ConvBranch per skip-destination layer (kernel = skip_conv).
@@ -706,7 +705,7 @@ class GPT(nn.Module):
         if self.conv_tower_blocks and self.conv_tower_mode == "alone":
             xc = self.conv_tower(x_emb)
             return self._head_ce(xc.reshape(-1, xc.size(-1)), targets.reshape(-1))
-        x0_bigram = None if self.no_bigram else self.bigram_embed(bigram_ids)  # (B, T, model_dim)
+        x0_bigram = self.bigram_embed(bigram_ids)             # (B, T, model_dim)
         smear_out = smear_lambda * torch.sigmoid(
             self.smear_gate(x_emb[:, 1:, :12])            # (B, T-1, 1)
         )
@@ -717,18 +716,13 @@ class GPT(nn.Module):
         x = x0 = norm(x)
 
         # Layer-0 bigram injection (before the loop)
-        if not self.no_bigram:
-            x = x + x0_bigram * self.bigram_lambdas[0]
+        x = x + x0_bigram * self.bigram_lambdas[0]
 
-        # Precompute per-layer x0/bigram injections (bigram term dropped if --no-bigram,
-        # so the parallel conv branch is the only source of local n-gram structure).
-        if self.no_bigram:
-            x0_inject = [x0 * self.x0_lambdas[i] for i in range(L)]
-        else:
-            x0_inject = [x0 * self.x0_lambdas[0]] + [
-                x0 * self.x0_lambdas[i] + x0_bigram * self.bigram_lambdas[i]
-                for i in range(1, L)
-            ]
+        # Precompute per-layer x0/bigram injections.
+        x0_inject = [x0 * self.x0_lambdas[0]] + [
+            x0 * self.x0_lambdas[i] + x0_bigram * self.bigram_lambdas[i]
+            for i in range(1, L)
+        ]
 
         # Skip gate (applied at layer 6 in place of attention)
         skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(
@@ -1132,7 +1126,6 @@ def train_one(config, train_data, val_data, seed, device):
         logit_temp=config.get("logit_temp", "none"),
         unigram_bias=config.get("unigram_bias", False),
         head_rank=config.get("head_rank", 0),
-        no_bigram=config.get("no_bigram", False),
         topology=config.get("topology"),
     ).to(device)
     model.ce_chunk = config.get("ce_chunk", 0)
@@ -1347,11 +1340,6 @@ def main():
                     help="output-head parameterization: 0 = tied to embedding (default); r>0 = tied "
                          "base + rank-r learned offset (cheap partial untie, starts tied); "
                          "-1 = full untie (separate lm_head, ~38M extra params).")
-    ap.add_argument("--no-bigram", action="store_true",
-                    help="drop the hashed bigram-embedding injection. Lets the parallel conv "
-                         "branch be the only source of local n-gram structure — tests whether a "
-                         "collision-free compositional conv can replace the collision-heavy "
-                         "bigram lookup (251k buckets for billions of token pairs).")
     ap.add_argument("--qk-layernorm", action="store_true",
                     help="replace the always-on RMSNorm QK-norm with LayerNorm(bias=False), "
                          "which also removes the mean (zero-centered). Tests whether the DC "
@@ -1447,7 +1435,6 @@ def main():
         logit_temp=args.logit_temp,
         unigram_bias=args.unigram_bias,
         head_rank=args.head_rank,
-        no_bigram=args.no_bigram,
         ce_chunk=args.ce_chunk,
         softcap=(0.0 if args.plain_ce else args.softcap_scale),
         max_seconds=args.max_seconds,
@@ -1504,8 +1491,6 @@ def main():
             key += "_ub"
         if args.head_rank:
             key += f"_hr{args.head_rank}"
-        if args.no_bigram:
-            key += "_nobg"
         if args.qk_layernorm:
             key += "_qkln"
         if args.kv_tied:
