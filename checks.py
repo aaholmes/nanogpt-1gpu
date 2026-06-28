@@ -11,9 +11,7 @@ import torch, harness as h
 CFG_OPT = {'optimizer':'normuon','muon_lr':0.02,'adam_lr':0.008,'adam_wd':0.0,'muon_wd':0.0,'adam_betas':(0.9,0.95)}
 
 ARMS = {
-    'baseline (relu2, tied)': dict(act_name='relu2'),
-    'sniqu':                  dict(act_name='sniqu'),
-    'reglu (gated)':          dict(act_name='reglu'),
+    'baseline (relu2, tied)': dict(),
     'logit-temp global':      dict(logit_temp='global'),
     'unigram-bias':           dict(unigram_bias=True),
     'head-rank 64 (low-rank)':dict(head_rank=64),
@@ -23,7 +21,7 @@ ARMS = {
 def build(**kw):
     torch.manual_seed(0)
     m = h.GPT(vocab_size=50304, num_layers=11, num_heads=4, head_dim=16, model_dim=64,
-              max_seq_len=64, device='cpu', act_name=kw.pop('act_name','relu2'), **kw).to('cpu')
+              max_seq_len=64, device='cpu', **kw).to('cpu')
     m.ce_chunk = 0
     return m
 

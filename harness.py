@@ -60,140 +60,19 @@ def mm8(x, weight):
 
 
 # -----------------------------------------------------------------------------
-# Activations (from phase1.py)
-
-class IQU(nn.Module):
-    def forward(self, x):
-        pos = F.relu(x)
-        neg = x - pos
-        return pos + pos * pos + neg / (1.0 - neg)
-
-
-class SNIQU(nn.Module):
-    BETA = 0.70638
-    LAM = 0.56004
-    def forward(self, x):
-        pos = F.relu(x)
-        neg = x - pos
-        h = pos + pos * pos + neg / (1.0 - neg)
-        return self.LAM * (h - self.BETA)
-
-
-class ReLU2(nn.Module):
-    def __init__(self, slope=0.0, shift=0.0, curv=1.0):
-        super().__init__()
-        self.slope, self.shift, self.curv = slope, shift, curv
-
-    def forward(self, x):
-        z = F.relu(x - self.shift) if self.shift else F.relu(x)
-        out = self.curv * z.square() if self.curv != 1.0 else z.square()
-        if self.slope:
-            out = out + self.slope * z
-        return out
-
-
-class XAbsX(nn.Module):
-    def __init__(self, slope=0.0, curv=1.0):
-        super().__init__()
-        self.slope, self.curv = slope, curv
-
-    def forward(self, x):
-        out = self.curv * x * x.abs() if self.curv != 1.0 else x * x.abs()
-        if self.slope:
-            out = out + self.slope * x
-        return out
-
-
-def _inv_softplus(y):
-    return math.log(math.expm1(y)) if y < 20 else y
-
-
-_INIT_VALUES = {
-    "gelu_minimax": dict(L=1.910, R=1.910, alpha=0.247),
-    "gelu_rms":     dict(L=1.749, R=1.749, alpha=0.275),
-    "c1":           dict(L=1.000, R=1.000, alpha=0.250),
-}
-
-
-class TriLU(nn.Module):
-    def __init__(self, asymmetric=True, init="gelu_minimax"):
-        super().__init__()
-        v = _INIT_VALUES[init]
-        if asymmetric:
-            self.theta_L = nn.Parameter(torch.tensor(_inv_softplus(v["L"])))
-            self.theta_R = nn.Parameter(torch.tensor(_inv_softplus(v["R"])))
-        else:
-            self.theta_a = nn.Parameter(torch.tensor(_inv_softplus(v["L"])))
-        self.theta_alpha = nn.Parameter(torch.tensor(_inv_softplus(v["alpha"])))
-        self.asymmetric = asymmetric
-
-    def get_params(self):
-        if self.asymmetric:
-            L = -F.softplus(self.theta_L)
-            R = F.softplus(self.theta_R)
-        else:
-            a = F.softplus(self.theta_a)
-            L, R = -a, a
-        return L, R, F.softplus(self.theta_alpha)
-
-    def forward(self, x):
-        L, R, alpha = self.get_params()
-        denom = (R - L).clamp(min=1e-6)
-        beta = R / denom - alpha * (L + R)
-        gamma = alpha * L * R - L * R / denom
-        q = alpha * x * x + beta * x + gamma
-        return torch.where(x <= L, torch.zeros_like(x), torch.where(x >= R, x, q))
-
-
-def make_activation(name, init="gelu_minimax", slope=0.0, shift=0.0, curv=1.0):
-    if name in ("relu2", "reglu"):   return ReLU2(slope=slope, shift=shift, curv=curv)
-    if name in ("gelu", "geglu"):    return nn.GELU()
-    if name == "swiglu":             return nn.SiLU()
-    if name == "trilu_sym":          return TriLU(asymmetric=False, init=init)
-    if name in ("trilu_asym", "triglu"): return TriLU(asymmetric=True, init=init)
-    if name in ("xabsx", "xglu"):    return XAbsX(slope=slope, curv=curv)
-    if name == "bilinear":           return nn.Identity()
-    if name == "iqu":                return IQU()
-    if name in ("sniqu", "iqu_sn"):  return SNIQU()
-    if name == "selu":               return nn.SELU()
-    raise ValueError(f"Unknown activation: {name}")
-
-
-GATED = {"swiglu", "geglu", "triglu", "xglu", "reglu", "bilinear"}
-
+# MLP
 
 class MLP(nn.Module):
-    def __init__(self, model_dim, act):
+    """The record's MLP: relu-squared activation, 4x hidden, zero-init output projection."""
+    def __init__(self, model_dim):
         super().__init__()
         hidden = 4 * model_dim
-        self.fc  = nn.Linear(model_dim, hidden, bias=False)
+        self.fc   = nn.Linear(model_dim, hidden, bias=False)
         self.proj = nn.Linear(hidden, model_dim, bias=False)
         nn.init.zeros_(self.proj.weight)
-        self.act = act
 
     def forward(self, x):
-        return mm8(self.act(mm8(x, self.fc.weight)), self.proj.weight)
-
-
-class GatedMLP(nn.Module):
-    def __init__(self, model_dim, act):
-        super().__init__()
-        hidden = max(64, round(8 * model_dim / 3 / 64) * 64)
-        self.fc      = nn.Linear(model_dim, hidden, bias=False)
-        self.fc_gate = nn.Linear(model_dim, hidden, bias=False)
-        self.proj    = nn.Linear(hidden, model_dim, bias=False)
-        nn.init.zeros_(self.proj.weight)
-        self.act = act
-
-    def forward(self, x):
-        return mm8(self.act(mm8(x, self.fc.weight)) * mm8(x, self.fc_gate.weight), self.proj.weight)
-
-
-def make_mlp(model_dim, act_name, init="gelu_minimax", slope=0.0, shift=0.0, curv=1.0):
-    act = make_activation(act_name, init, slope, shift, curv)
-    if act_name in GATED:
-        return GatedMLP(model_dim, act)
-    return MLP(model_dim, act)
+        return mm8(F.relu(mm8(x, self.fc.weight)).square(), self.proj.weight)
 
 
 # -----------------------------------------------------------------------------
@@ -423,8 +302,7 @@ def next_multiple_of_n(v, n):
 
 class GPT(nn.Module):
     def __init__(self, vocab_size, num_layers, num_heads, head_dim, model_dim,
-                 max_seq_len, device, act_name="relu2", act_init="gelu_minimax",
-                 act_slope=0.0, act_shift=0.0, act_curv=1.0, qk_layernorm=False,
+                 max_seq_len, device, qk_layernorm=False,
                  paired_heads=False, kv_tied=False, v_identity=False, drop_o=False,
                  logit_temp="none", unigram_bias=False, head_rank=0):
         super().__init__()
@@ -546,7 +424,7 @@ class GPT(nn.Module):
 
         # Per-layer MLP modules
         self.mlp_modules = nn.ModuleList([
-            make_mlp(model_dim, act_name, act_init, act_slope, act_shift, act_curv)
+            MLP(model_dim)
             for _ in range(L)
         ])
 
@@ -734,7 +612,7 @@ def build_optimizers(model, config):
     # mlp_gate_params: fc_gate weights in GatedMLP (the selection branch)
     # matrix_params:   all other 2D attention/MLP weights (value/projection branches)
     matrix_params, mlp_gate_params, scalar_params, gate_params = [], [], [], []
-    ve_params, bigram_params, lmhead_params, other_params, trilu_params = [], [], [], [], []
+    ve_params, bigram_params, lmhead_params, other_params = [], [], [], []
 
     for name, p in model.named_parameters():
         if name == "embed.weight":
@@ -742,8 +620,6 @@ def build_optimizers(model, config):
             # THIS name, so it must be optimized here -- previously it was skipped, which left the
             # tied embedding+head frozen at init. Untied: this is the standalone embedding.
             lmhead_params.append(p)
-        elif "theta_" in name:
-            trilu_params.append(p)
         elif p.ndim == 2 and "mlp_modules" in name and "fc_gate" in name:
             mlp_gate_params.append(p)  # gating/selection branch of GatedMLP
         elif p.ndim == 2 and any(k in name for k in ("attn_modules", "mlp_modules")):
@@ -781,7 +657,6 @@ def build_optimizers(model, config):
             ag(bigram_params,  lr_mul=75.0, betas=(0.75, 0.95), wd_mul=5.0),
             ag(lmhead_params,  lr_mul=1.0,  betas=(0.5, 0.95),  wd_mul=150.0),
             ag(other_params,   lr_mul=1.0,  betas=(0.9, 0.95)),
-            ag(trilu_params,   lr_mul=0.1,  betas=(0.9, 0.95)),
         ]))
 
         # Hybrid mode: gate branch (fc_gate) → AdamW; value/proj + attention → Muon.
@@ -818,9 +693,6 @@ def build_optimizers(model, config):
         groups = []
         if all_params:
             groups.append({"params": all_params, "base_lr": alr, "lr": alr,
-                           "betas": (0.9, 0.95), "weight_decay": awd})
-        if trilu_params:
-            groups.append({"params": trilu_params, "base_lr": alr * 0.1, "lr": alr * 0.1,
                            "betas": (0.9, 0.95), "weight_decay": awd})
         return [torch.optim.AdamW(groups, lr=alr, betas=(0.9, 0.95), weight_decay=awd)]
 
@@ -938,11 +810,6 @@ def train_one(config, train_data, val_data, seed, device):
         model_dim=config["model_dim"],
         max_seq_len=config["seq_len"],
         device=device,
-        act_name=config["activation"],
-        act_init=config.get("act_init", "gelu_minimax"),
-        act_slope=config.get("act_slope", 0.0),
-        act_shift=config.get("act_shift", 0.0),
-        act_curv=config.get("act_curv", 1.0),
         qk_layernorm=config.get("qk_layernorm", False),
         paired_heads=config.get("paired_heads", False),
         kv_tied=config.get("kv_tied", False),
@@ -956,7 +823,7 @@ def train_one(config, train_data, val_data, seed, device):
 
     cmodel = torch.compile(model) if config.get("compile") else model
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  params: {n_params:,}  act={config['activation']}  opt={config.get('optimizer','normuon')}"
+    print(f"  params: {n_params:,}  opt={config.get('optimizer','normuon')}"
           f"{'  compile' if config.get('compile') else ''}")
 
     optimizers = build_optimizers(model, config)
@@ -1058,11 +925,6 @@ CONFIGS = {
     ),
 }
 
-ALL_ACTIVATIONS = ["relu2", "gelu", "trilu_sym", "trilu_asym", "swiglu", "geglu", "triglu",
-                   "xabsx", "xglu", "reglu", "bilinear", "iqu", "sniqu", "selu"]
-DEFAULT_ACTIVATIONS = ["relu2", "sniqu", "xglu", "reglu"]
-
-
 # -----------------------------------------------------------------------------
 # Main
 
@@ -1074,11 +936,6 @@ def main():
     ap.add_argument("--seed-start", type=int,   default=0)
     ap.add_argument("--steps",      type=int,   default=None)
     ap.add_argument("--batch-size", type=int,   default=None)
-    ap.add_argument("--activations",type=str,   default=",".join(DEFAULT_ACTIVATIONS))
-    ap.add_argument("--init",       type=str,   default="gelu_minimax", choices=list(_INIT_VALUES))
-    ap.add_argument("--act-slope",  type=float, default=0.0)
-    ap.add_argument("--act-shift",  type=float, default=0.0)
-    ap.add_argument("--act-curv",   type=float, default=1.0)
     ap.add_argument("--optimizer",  type=str,   default="normuon",
                     choices=["normuon", "muon", "adamw", "hybrid", "hybrid-muon"],
                     help="hybrid/hybrid-muon: gate branch (fc_gate) → AdamW, "
@@ -1172,8 +1029,7 @@ def main():
     cfg.update(dict(
         optimizer=args.optimizer,
         muon_lr=args.muon_lr, muon_beta2=args.muon_beta2, muon_ortho=args.muon_ortho,
-        act_slope=args.act_slope, act_shift=args.act_shift, act_curv=args.act_curv,
-        act_init=args.init, compile=args.compile,
+        compile=args.compile,
         target_loss=args.target_loss,
         stop_at_target=args.stop_at_target,
         qk_layernorm=args.qk_layernorm,
@@ -1198,12 +1054,6 @@ def main():
         device = "cpu"
     print(f"Device: {device}  Config: {args.config}  steps={cfg['total_steps']}  seeds={args.seeds}")
 
-    activations = args.activations.split(",")
-    for a in activations:
-        if a not in ALL_ACTIVATIONS:
-            print(f"Unknown activation: {a}")
-            sys.exit(1)
-
     train_cap = 5_000_000 if args.config == "tiny" else 0
     val_cap   = 1_000_000 if args.config == "tiny" else 0
     train_data, val_data = load_data(args.data_dir, train_cap, val_cap)
@@ -1216,42 +1066,26 @@ def main():
     else:
         all_results = {}
 
-    for act in activations:
-        run_cfg = dict(cfg, activation=act)
-        key = act
-        if args.act_slope or args.act_shift:
-            key += f"_s{args.act_slope:g}t{args.act_shift:g}"
-        if args.act_curv != 1.0:
-            key += f"_c{args.act_curv:g}"
-        if args.optimizer != "normuon":
-            key += f"_{args.optimizer}"
-        if args.logit_temp != "none":
-            key += f"_lt{args.logit_temp[0]}"
-        if args.unigram_bias:
-            key += "_ub"
-        if args.head_rank:
-            key += f"_hr{args.head_rank}"
-        if args.qk_layernorm:
-            key += "_qkln"
-        if args.kv_tied:
-            key += "_kv"
-        if args.v_identity:
-            key += "_vI"
-        if args.drop_o:
-            key += "_noO"
-        if args.num_heads or args.head_dim:
-            key += f"_h{cfg['num_heads']}x{cfg['head_dim']}"
-        if key not in all_results:
-            all_results[key] = []
-        for seed in range(args.seed_start, args.seed_start + args.seeds):
-            print(f"\n=== act={act}  seed={seed} ===")
-            log = train_one(run_cfg, train_data, val_data, seed, device)
-            all_results[key].append(log)
-            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-            with open(args.out, "w") as f:
-                # serialize any sets (e.g. layer-index sets) as sorted lists
-                json.dump(all_results, f, indent=2,
-                          default=lambda o: sorted(o) if isinstance(o, set) else str(o))
+    # Run key encodes the non-default screening axes, so results accumulate per-config.
+    key = "run"
+    if args.optimizer != "normuon":     key += f"_{args.optimizer}"
+    if args.logit_temp != "none":       key += f"_lt{args.logit_temp[0]}"
+    if args.unigram_bias:               key += "_ub"
+    if args.head_rank:                  key += f"_hr{args.head_rank}"
+    if args.qk_layernorm:               key += "_qkln"
+    if args.kv_tied:                    key += "_kv"
+    if args.v_identity:                 key += "_vI"
+    if args.drop_o:                     key += "_noO"
+    if args.num_heads or args.head_dim: key += f"_h{cfg['num_heads']}x{cfg['head_dim']}"
+    all_results.setdefault(key, [])
+    for seed in range(args.seed_start, args.seed_start + args.seeds):
+        print(f"\n=== {key}  seed={seed} ===")
+        log = train_one(cfg, train_data, val_data, seed, device)
+        all_results[key].append(log)
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.out, "w") as f:
+            json.dump(all_results, f, indent=2,
+                      default=lambda o: sorted(o) if isinstance(o, set) else str(o))
     print(f"\nSaved to {args.out}")
 
 
