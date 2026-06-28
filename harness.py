@@ -502,9 +502,8 @@ def build_optimizers(model, config):
     opt_name = config.get("optimizer", "normuon")
 
     # Partition parameters
-    # mlp_gate_params: fc_gate weights in GatedMLP (the selection branch)
-    # matrix_params:   all other 2D attention/MLP weights (value/projection branches)
-    matrix_params, mlp_gate_params, scalar_params, gate_params = [], [], [], []
+    # matrix_params: all 2D attention/MLP weights (Muon-trained); everything else → AdamW.
+    matrix_params, scalar_params, gate_params = [], [], []
     ve_params, bigram_params, lmhead_params, other_params = [], [], [], []
 
     for name, p in model.named_parameters():
@@ -513,10 +512,8 @@ def build_optimizers(model, config):
             # THIS name, so it must be optimized here -- previously it was skipped, which left the
             # tied embedding+head frozen at init. Untied: this is the standalone embedding.
             lmhead_params.append(p)
-        elif p.ndim == 2 and "mlp_modules" in name and "fc_gate" in name:
-            mlp_gate_params.append(p)  # gating/selection branch of GatedMLP
         elif p.ndim == 2 and any(k in name for k in ("attn_modules", "mlp_modules")):
-            matrix_params.append(p)    # value/projection branches + attention + conv-branch/tower/skip pointwise
+            matrix_params.append(p)    # attention + MLP value/projection weights
         elif name in ("scalars", "post_lambdas", "resid_lambdas", "x0_lambdas", "bigram_lambdas"):
             scalar_params.append(p)
         elif any(k in name for k in ("smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank")):
@@ -532,14 +529,14 @@ def build_optimizers(model, config):
 
     # Coverage guarantee: every trainable parameter is routed to exactly one group. A
     # silently-dropped parameter (the frozen-embedding/head bug class) fails loud here.
-    routed = (matrix_params + mlp_gate_params + scalar_params + gate_params +
+    routed = (matrix_params + scalar_params + gate_params +
               ve_params + bigram_params + lmhead_params + other_params)
     routed_ids = {id(p) for p in routed}
     missing = [n for n, p in model.named_parameters() if p.requires_grad and id(p) not in routed_ids]
     assert not missing, f"parameters not routed to any optimizer group: {missing}"
     assert len(routed) == len(routed_ids), "a parameter was routed to more than one optimizer group"
 
-    if opt_name in ("normuon", "muon", "hybrid", "hybrid-muon"):
+    if opt_name in ("normuon", "muon"):
         # ── NorMuon / Muon path ──────────────────────────────────────────────
         # Matrix weights → Muon/NorMuon. Everything else → AdamW with
         # per-group lr_muls calibrated to train_gpt.py's param_table
@@ -561,21 +558,8 @@ def build_optimizers(model, config):
             ag(other_params,   lr_mul=1.0,  betas=(0.9, 0.95)),
         ]))
 
-        # Hybrid mode: gate branch (fc_gate) → AdamW; value/proj + attention → Muon.
-        # For non-hybrid modes, mlp_gate_params fold into matrix_params (Muon).
-        is_hybrid = opt_name in ("hybrid", "hybrid-muon")
-        if is_hybrid:
-            # Gate matrices join the Adam groups at base adam_lr (no special lr_mul —
-            # in AdamW mode these are the "body" weights, not the sub-LR scalars)
-            if mlp_gate_params:
-                adam_groups.append({"params": mlp_gate_params,
-                                    "base_lr": alr, "lr": alr,
-                                    "betas": (0.9, 0.95), "weight_decay": awd})
-        else:
-            matrix_params = matrix_params + mlp_gate_params  # all matrices → Muon
-
         mlr   = config.get("muon_lr", 0.023)
-        beta2 = config.get("muon_beta2", 0.9) if opt_name in ("normuon", "hybrid") else None
+        beta2 = config.get("muon_beta2", 0.9) if opt_name == "normuon" else None
         muon_opt = Muon(
             [{"params": matrix_params, "base_lr": mlr, "lr": mlr}],
             lr=mlr, beta2=beta2, ortho=config.get("muon_ortho", "polar_express"),
@@ -832,11 +816,10 @@ def main():
     ap.add_argument("--steps",      type=int,   default=None)
     ap.add_argument("--batch-size", type=int,   default=None)
     ap.add_argument("--optimizer",  type=str,   default="normuon",
-                    choices=["normuon", "muon", "adamw", "hybrid", "hybrid-muon"],
-                    help="hybrid/hybrid-muon: gate branch (fc_gate) → AdamW, "
-                         "value/proj + attention → NorMuon/Muon. Tests whether "
-                         "splitting the optimizer by parameter role captures the "
-                         "best of gating (AdamW) and orthogonalization (Muon).")
+                    choices=["normuon", "muon", "adamw"],
+                    help="normuon (default): Muon for matrices + AdamW for the rest, with "
+                         "neuron-wise variance reduction. muon: Muon without it. adamw: all "
+                         "parameters on AdamW (the optimizer-dependence baseline).")
     ap.add_argument("--muon-lr",    type=float, default=0.023)
     ap.add_argument("--muon-beta2", type=float, default=0.9)
     ap.add_argument("--muon-ortho", type=str,   default="polar_express",
