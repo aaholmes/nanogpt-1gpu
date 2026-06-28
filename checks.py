@@ -24,7 +24,7 @@ def build(**kw):
     torch.manual_seed(0)
     m = h.GPT(vocab_size=50304, num_layers=11, num_heads=4, head_dim=16, model_dim=64,
               max_seq_len=64, device='cpu', act_name=kw.pop('act_name','relu2'), **kw).to('cpu')
-    m.ce_chunk = 0; m.softcap = 0.0
+    m.ce_chunk = 0
     return m
 
 def check_arm(name, kw):

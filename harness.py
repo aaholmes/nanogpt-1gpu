@@ -554,7 +554,6 @@ class GPT(nn.Module):
         self.paired_head_layers = set(topo["paired_layers"]) if paired_heads else set()
 
         self.ce_chunk = 0  # set externally after construction; 0 = full logits
-        self.softcap  = 23.0  # logit softcap scale (set externally); 0 = plain CE
 
         # RoPE — only allocate paired Yarn if paired heads are enabled
         self.yarn        = Yarn(head_dim, max_seq_len, device, paired=False)
@@ -663,21 +662,19 @@ class GPT(nn.Module):
         return logits
 
     def _head_ce(self, x_flat, t_flat):
-        # Softcapped cross-entropy through the (shared) lm_head; chunked to avoid the full
-        # (B*T, vocab) logit tensor (~1.65 GB at batch 16).
+        # Plain cross-entropy through the (shared) lm_head; chunked to avoid materializing the
+        # full (B*T, vocab) logit tensor.
         s = self._logit_scale(x_flat)
         if self.ce_chunk and self.ce_chunk > 0:
-            return self._chunked_softcap_ce(x_flat, t_flat, self.ce_chunk, s)
+            return self._chunked_ce(x_flat, t_flat, self.ce_chunk, s)
         logits = self._head_logits(x_flat)
         if s is not None:
             logits = s * logits
         if self.unigram_bias is not None:
             logits = logits + self.unigram_bias
-        if self.softcap and self.softcap > 0:
-            logits = self.softcap * torch.sigmoid((logits + 5) / 7.5)
         return F.cross_entropy(logits, t_flat)
 
-    def _chunked_softcap_ce(self, x_flat, targets_flat, chunk, s=None):
+    def _chunked_ce(self, x_flat, targets_flat, chunk, s=None):
         per_pos = s is not None and s.dim() > 0 and s.shape[0] == x_flat.shape[0]
         def _chunk_loss(x_c, t_c, s_c):
             logits = self._head_logits(x_c)
@@ -685,8 +682,6 @@ class GPT(nn.Module):
                 logits = s_c * logits
             if self.unigram_bias is not None:
                 logits = logits + self.unigram_bias
-            if self.softcap and self.softcap > 0:
-                logits = self.softcap * torch.sigmoid((logits + 5) / 7.5)
             return F.cross_entropy(logits, t_c, reduction="sum")
         n = x_flat.size(0)
         total = x_flat.new_zeros(())
@@ -958,7 +953,6 @@ def train_one(config, train_data, val_data, seed, device):
         head_rank=config.get("head_rank", 0),
     ).to(device)
     model.ce_chunk = config.get("ce_chunk", 0)
-    model.softcap  = config.get("softcap", 23.0)
 
     cmodel = torch.compile(model) if config.get("compile") else model
     n_params = sum(p.numel() for p in model.parameters())
@@ -1109,15 +1103,6 @@ def main():
                          "the residual stream. Tests whether the MLP can absorb cross-head mixing. "
                          "Each head is confined to write into its own coordinate block. Requires "
                          "hdim == model_dim.")
-    ap.add_argument("--softcap-scale", type=float, default=23.0,
-                    help="logit softcap scale: logits = s*sigmoid((logits+5)/7.5). "
-                         "23 = speedrun default. Larger s → less compression (closer "
-                         "to plain CE, sharper achievable softmax); smaller s → more "
-                         "compression (flatter, more regularised).")
-    ap.add_argument("--plain-ce", action="store_true",
-                    help="bypass the softcap entirely (plain cross-entropy). Equivalent "
-                         "to --softcap-scale 0. Reaches a meaningful loss regime at low "
-                         "compute, at the cost of fidelity to the record's eval path.")
     ap.add_argument("--ce-chunk", type=int, default=0,
                     help="chunk size for cross-entropy (tokens). 0 = full logits (~1.65 GB at "
                          "batch 16). Use 4096 to avoid OOM on 16 GB GPUs with paired heads.")
@@ -1200,7 +1185,6 @@ def main():
         unigram_bias=args.unigram_bias,
         head_rank=args.head_rank,
         ce_chunk=args.ce_chunk,
-        softcap=(0.0 if args.plain_ce else args.softcap_scale),
         max_seconds=args.max_seconds,
     ))
 
