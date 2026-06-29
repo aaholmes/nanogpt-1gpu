@@ -21,5 +21,6 @@ __pycache__/
 
 # parked: bug story + findings (kept locally, re-addable later)
 /BUGLOG.md
-/figures/
+/figures/*
+!/figures/to_target.png
 /results/

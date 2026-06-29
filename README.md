@@ -2,7 +2,7 @@
 <!-- After pushing, enable the CI badge (replace OWNER):
 [![checks](https://github.com/OWNER/nanogpt-1gpu/actions/workflows/checks.yml/badge.svg)](https://github.com/OWNER/nanogpt-1gpu/actions/workflows/checks.yml) -->
 
-A single-GPU adaptation of the [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) speedrun, for local experimentation and architecture screening on **one consumer GPU (16 GB)**. The speedrun trains a 124M-parameter GPT on FineWeb to 3.28 validation loss as fast as possible on 8×H100 — hardware beyond a typical home setup. This is a faithful-where-it-can-be re-implementation that runs on a single GPU, paired with a methodology built to keep comparisons trustworthy.
+A single-GPU adaptation of the [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) speedrun, for local experimentation and architecture screening on **one consumer GPU (16 GB)**. The speedrun trains a GPT-2-scale model (124M transformer core) on FineWeb to 3.28 validation loss as fast as possible on 8×H100 — hardware beyond a typical home setup. This is a faithful-where-it-can-be re-implementation that runs on a single GPU, paired with a methodology built to keep comparisons trustworthy.
 
 It's a research **harness, not a benchmark** — a tool I use to decide what's worth validating on the real thing, not a stable reference for others to adopt. Absolute numbers here don't transfer to the record; the value is in the *rankings* and the *method*.
 
@@ -13,6 +13,16 @@ It's a research **harness, not a benchmark** — a tool I use to decide what's w
 One file, [`harness.py`](harness.py) (~950 lines, in the single-file nanoGPT tradition): the record's architecture — RoPE/YaRN, value + bigram embeddings, paired-head attention with skip/backout connections, always-on QK-norm, a relu-squared MLP, and a tied output head — trained with **NorMuon** (Polar-Express orthogonalization) under a **trapezoidal/WSD learning-rate schedule** on a wall-clock budget, plain cross-entropy. No experimental sprawl: one MLP, one activation, one head — the validated configuration.
 
 The single-GPU simplifications (SDPA instead of FlashAttention-3, bf16 instead of FP8, a pure-PyTorch orthogonalizer, fixed batch/sequence length) are deliberate and documented below.
+
+## A single-GPU reference run
+
+Trained end to end on one RTX 5060 Ti (16 GB) — batch 12, ~1.1B tokens, ~12 h:
+
+![single-GPU reference run](figures/to_target.png)
+
+The model is ~500M parameters (the 124M transformer core plus the speedrun's value- and bigram-embedding tables). The curve has the shape you want — a fast warmup drop, a stable plateau, a cooldown bend — and bottoms out around **4.06** validation loss. That sits well above the record's **3.28**, and the gap is the interesting part: this is one 16 GB GPU at batch 12 with a learning rate tuned for short screening runs, versus 8×H100 with a far larger effective batch and a tuned full-length schedule. Closing it needs gradient accumulation (a larger effective batch) and a higher LR — not just more tokens, since at ~1.1B this run is already in the record's token range.
+
+The point isn't the absolute number; it's that the harness trains the faithful architecture correctly and predictably, and that the limits are understood rather than papered over. (Validation loss is a 20-batch estimate; the random/unigram lines are the sanity floors from `checks.py`.)
 
 ## Methodology
 
