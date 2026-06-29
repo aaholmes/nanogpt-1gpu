@@ -20,9 +20,7 @@ Trained end to end on one RTX 5060 Ti (16 GB) — batch 12, ~1.1B tokens, ~12 h:
 
 ![single-GPU reference run](figures/to_target.png)
 
-The model is ~500M parameters (the 124M transformer core plus the speedrun's value- and bigram-embedding tables). The curve has the shape you want — a fast warmup drop, a stable plateau, a cooldown bend — and bottoms out around **4.06** validation loss. That sits well above the record's **3.28**, and the gap is the interesting part: this is one 16 GB GPU at batch 12 with a learning rate tuned for short screening runs, versus 8×H100 with a far larger effective batch and a tuned full-length schedule. Closing it needs gradient accumulation (a larger effective batch) and a higher LR — not just more tokens, since at ~1.1B this run is already in the record's token range.
-
-The point isn't the absolute number; it's that the harness trains the faithful architecture correctly and predictably, and that the limits are understood rather than papered over. (Validation loss is a 20-batch estimate; the random/unigram lines are the sanity floors from `checks.py`.)
+The full ~500M-parameter model (the 124M transformer core plus the speedrun's value- and bigram-embedding tables) reaches **4.06** validation loss. The record reaches **3.28** on 8×H100; the gap reflects the much smaller batch and a learning rate tuned for short runs, not a shortage of tokens. The random and unigram lines are the sanity floors from `checks.py`.
 
 ## Methodology
 
